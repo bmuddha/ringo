@@ -1,25 +1,38 @@
-use std::{
-    io::{self, Write},
-    ops::{Deref, DerefMut},
-    sync::atomic::{AtomicU32, Ordering::*},
-};
+//! Allocator based on ring buffer. All allocations are done from underlying primary buffer, in a
+//! cicular manner, i.e. the allocator wraps around once it reaches the end. Allocation is a very
+//! cheap/fast operation, as it usually involves only adjusting a few pointers. The provided buffer
+//! can safely sent to other threads or even cloned (after making it immutable), once the buffer is
+//! dropped its backing store becomes available for new allocations. Primary use case is to
+//! allocate scratch memory from ring buffer, fill it with data and hand it off to reader (on the
+//! same thread or other threads), which promptly discards the buffer after it get's what it needs
+//! from it, so that no one holds on to memory buffers for too long, otherwise the allocator will
+//! just run out of allocatable memory. Current implementation uses head pointer which performs
+//! quick scan of primary buffer for usable segments and hands them off to caller, but if it
+//! encouneters busy segment it will terminate the scan, so it's possible to jam the allocator by
+//! not releasing a single small segment.
+
+use std::io;
+
+use buffer::{BufferMut, BufferWriter};
+use header::HeaderMut;
 
 const U32SIZE: usize = size_of::<u32>();
 const MAXALLOC: u32 = u32::MAX >> 1;
-const MAXALLOCBYTES: usize = (u32::MAX >> 1) as usize * U32SIZE;
+pub const MAXALLOCBYTES: usize = (u32::MAX >> 1) as usize * U32SIZE;
 const MINALLOC: u32 = 8;
-const MINALLOCBYTES: usize = MINALLOC as usize * U32SIZE;
+pub const MINALLOCBYTES: usize = MINALLOC as usize * U32SIZE;
 
+/// Ring Allocator, unclonable type, which should be owned by a single writer thread, which can
+/// then dispatch allocated buffers to other threads safely. See crate level documentation
 pub struct Ringal {
+    /// Start of the primary buffer
     start: *mut u32,
+    /// End of the primary buffer
     end: *const u32,
+    /// current location of head pointer, next allocation
+    /// request will be attempted from this address
     head: *mut u32,
 }
-
-type HeaderMut = Header<*mut AtomicU32>;
-type HeaderRo = Header<*const AtomicU32>;
-
-struct Header<P>(P);
 
 impl Ringal {
     pub fn new(capacity: usize) -> Self {
@@ -60,18 +73,23 @@ impl Ringal {
     }
 
     /// # Safety
-    /// returns uninitialized memory of requested size rounded up to alignment
+    /// returns uninitialized memory of requested size rounded up to MINALLOCBYTES
     /// call `fill` on returned buffer if initializition is required, otherwise
     /// don't read data before writing something to buffer
-    pub unsafe fn fixed(&mut self, min: usize) -> Option<BufferMut> {
+    pub unsafe fn fixed_uninit(&mut self, min: usize) -> Option<BufferMut> {
         let header = self.alloc(min)?;
-        let capacity = header.capacity() as usize;
         let inner = header.buffer();
         header.set();
         let buffer = BufferMut {
             header: header.into(),
-            inner: unsafe { std::slice::from_raw_parts_mut(inner, capacity) },
+            inner: unsafe { std::slice::from_raw_parts_mut(inner, min) },
         };
+        Some(buffer)
+    }
+
+    pub fn fixed(&mut self, min: usize) -> Option<BufferMut> {
+        let mut buffer = unsafe { self.fixed_uninit(min) }?;
+        buffer.fill(0);
         Some(buffer)
     }
 
@@ -89,7 +107,7 @@ impl Ringal {
         let mut current = self.head;
         let mut wrapped = false;
         loop {
-            let header = Header::new(current);
+            let header = HeaderMut::new(current);
             header.available().then_some(())?;
 
             let size = header.capacity();
@@ -98,22 +116,22 @@ impl Ringal {
                 break;
             }
 
-            let next = unsafe { current.add(size as usize + U32SIZE) };
+            let next = unsafe { current.add(size as usize + 1) };
             accumulated += 1;
 
             current = if next.cast_const() >= self.end {
                 accumulated = 0;
+                (!wrapped).then_some(())?;
                 wrapped = true;
                 self.start
             } else {
                 next
             };
-            (self.head != current).then_some(())?;
         }
         if wrapped {
             self.head = self.start
         };
-        let header = Header::new(self.head);
+        let header = HeaderMut::new(self.head);
         let cap = if accumulated - capacity <= MINALLOC {
             accumulated
         } else {
@@ -126,7 +144,7 @@ impl Ringal {
         } else {
             self.head = next;
             if accumulated - capacity > MINALLOC {
-                let header = Header::new(self.head);
+                let header = HeaderMut::new(self.head);
                 let distance = unsafe { self.end.offset_from(self.head) } as u32;
                 header.store((accumulated - capacity).min(distance));
                 header.unset();
@@ -137,267 +155,8 @@ impl Ringal {
     }
 }
 
-impl Clone for HeaderRo {
-    fn clone(&self) -> Self {
-        Self(self.0)
-    }
-}
+mod buffer;
+mod header;
 
-impl HeaderMut {
-    fn new(ptr: *mut u32) -> Self {
-        Self(ptr as *mut AtomicU32)
-    }
-
-    fn set(&self) {
-        unsafe { &*self.0 }.fetch_or(1, Release);
-    }
-
-    fn unset(&self) {
-        unsafe { &*self.0 }.fetch_and(u32::MAX << 1, Release);
-    }
-
-    fn store(&self, size: u32) {
-        unsafe { &*self.0 }.store(size << 1, Release);
-    }
-
-    fn capacity(&self) -> u32 {
-        unsafe { &*self.0 }.load(Acquire) >> 1
-    }
-
-    fn available(&self) -> bool {
-        (unsafe { &*self.0 }.load(Acquire) & 1) == 0
-    }
-
-    fn buffer(&self) -> *mut u8 {
-        unsafe { self.0.add(1) as *mut u8 }
-    }
-}
-
-impl HeaderRo {
-    fn unset(&self) {
-        unsafe { &*self.0 }.fetch_and(u32::MAX << 1, Release);
-    }
-}
-
-pub struct BufferWriter<'a> {
-    inner: *mut u8,
-    header: Header<*mut AtomicU32>,
-    initialized: usize,
-    capacity: usize,
-    ringo: &'a mut Ringal,
-}
-
-impl<'a> BufferWriter<'a> {
-    pub fn finish(self) -> BufferMut {
-        let inner = unsafe { std::slice::from_raw_parts_mut(self.inner, self.initialized) };
-        self.header.set();
-        BufferMut {
-            header: self.header.into(),
-            inner,
-        }
-    }
-}
-
-impl<'a> Write for BufferWriter<'a> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.initialized == MAXALLOCBYTES {
-            io::Error::other("max allocation size reached");
-        }
-        let len = buf.len().min(MAXALLOCBYTES - self.initialized);
-
-        let required = self.initialized + len;
-        if required > self.capacity {
-            let extra = (required - self.capacity).max(MINALLOCBYTES);
-            self.ringo.extend(&self.header, extra)?;
-            self.capacity = self.header.capacity() as usize * U32SIZE;
-        }
-        unsafe {
-            self.inner
-                .add(self.initialized)
-                .copy_from_nonoverlapping(buf.as_ptr(), len)
-        };
-        self.initialized += len;
-        Ok(len)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-pub struct BufferMut {
-    header: HeaderRo,
-    inner: &'static mut [u8],
-}
-
-pub struct Buffer {
-    header: HeaderRo,
-    inner: &'static [u8],
-    rc: &'static AtomicU32,
-}
-
-impl From<HeaderMut> for HeaderRo {
-    fn from(value: HeaderMut) -> Self {
-        Self(value.0)
-    }
-}
-
-impl Deref for Buffer {
-    type Target = [u8];
-    fn deref(&self) -> &Self::Target {
-        self.inner
-    }
-}
-
-impl Clone for Buffer {
-    fn clone(&self) -> Self {
-        self.rc.fetch_add(1, Release);
-        Self {
-            inner: self.inner,
-            rc: self.rc,
-            header: self.header.clone(),
-        }
-    }
-}
-
-impl Drop for Buffer {
-    fn drop(&mut self) {
-        let mut count = self.rc.load(Acquire);
-        loop {
-            if count == 1 {
-                break;
-            }
-            if let Err(c) = self.rc.compare_exchange(count, count - 1, Release, Acquire) {
-                count = c;
-            } else {
-                return;
-            }
-        }
-        self.header.unset();
-        // SAFETY: checked above that we are the last reference holder,
-        // which makes it safe to reclaim the storage for AtomicU32
-        let _ = unsafe { Box::from_raw(self.rc.as_ptr() as *mut AtomicU32) };
-    }
-}
-
-impl Drop for BufferMut {
-    fn drop(&mut self) {
-        self.header.unset();
-    }
-}
-
-impl Deref for BufferMut {
-    type Target = [u8];
-    fn deref(&self) -> &Self::Target {
-        self.inner
-    }
-}
-
-impl DerefMut for BufferMut {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.inner
-    }
-}
-
-impl BufferMut {
-    pub fn init(&mut self) {
-        self.inner.fill(0);
-    }
-
-    pub fn freeze(self) -> Buffer {
-        let rc = Box::leak(Box::new(AtomicU32::new(1)));
-        let inner = unsafe { std::slice::from_raw_parts(self.inner.as_ptr(), self.inner.len()) };
-        let ro = Buffer {
-            inner,
-            rc,
-            header: self.header.clone(),
-        };
-        // don't run Drop on BufferMut, Buffer is now responsible for cleanup
-        std::mem::forget(self);
-        ro
-    }
-}
 #[cfg(test)]
-mod tests {
-    use std::collections::VecDeque;
-
-    use crate::*;
-    const BUFSIZE: usize = 1024;
-    const CHUNKSIZE: usize = MINALLOCBYTES;
-    const TESTMSG: &[u8] = b"TEST MESSAGE";
-    const LONGMSG: &[u8] = b"THIS IS A VERY LONG MESSAGE! THIS IS A VERY LONG MESSAGE! THIS IS A VERY LONG MESSAGE! THIS IS A VERY LONG MESSAGE! THIS IS A VERY LONG MESSAGE!";
-    const LONGMSGLEN: usize = LONGMSG.len();
-
-    #[test]
-    fn test_alloc() {
-        let mut ringal = Ringal::new(BUFSIZE);
-        let header1 = ringal.alloc(CHUNKSIZE).unwrap();
-        assert!(header1.available());
-        assert_eq!(header1.capacity(), (CHUNKSIZE / U32SIZE) as u32);
-        let header2 = ringal.alloc(CHUNKSIZE).unwrap();
-        assert_eq!(header2.0, unsafe { header1.0.add(CHUNKSIZE / U32SIZE + 1) });
-    }
-
-    #[test]
-    fn test_writer() {
-        let mut ringal = Ringal::new(BUFSIZE);
-
-        let mut buffer = ringal.writer(CHUNKSIZE).unwrap();
-        assert!(buffer.write(TESTMSG).is_ok());
-        let buffer = buffer.finish();
-        assert_eq!(buffer.as_ref(), TESTMSG);
-        let buffer = buffer.freeze();
-        assert_eq!(buffer.as_ref(), TESTMSG);
-    }
-
-    #[test]
-    fn test_extendable_writer() {
-        let mut ringal = Ringal::new(BUFSIZE);
-
-        let mut buffer = ringal.writer(CHUNKSIZE).unwrap();
-        let result = buffer.write(LONGMSG);
-        assert!(result.is_ok());
-        let buffer = buffer.finish();
-        assert_eq!(buffer.as_ref(), LONGMSG);
-        let header = ringal.alloc(CHUNKSIZE).unwrap();
-        let offset = unsafe { buffer.as_ptr().add(LONGMSGLEN) };
-        assert_eq!(offset, header.0 as *const u8);
-    }
-
-    #[test]
-    fn test_alloc_fail() {
-        let mut ringal = Ringal::new(BUFSIZE);
-        let count = BUFSIZE / (CHUNKSIZE + U32SIZE);
-        let mut buffers = Vec::with_capacity(count);
-        for _ in 0..count {
-            let buffer = unsafe { ringal.fixed(CHUNKSIZE) }.unwrap();
-            buffers.push(buffer);
-        }
-        let buffer = ringal.alloc(CHUNKSIZE);
-        assert!(buffer.is_none());
-    }
-
-    #[test]
-    fn test_realloc() {
-        let mut ringal = Ringal::new(BUFSIZE);
-        let buffer1 = unsafe { ringal.fixed(BUFSIZE / 2 - U32SIZE * 2) }.unwrap();
-        let _buffer2 = unsafe { ringal.fixed(BUFSIZE / 2 - U32SIZE * 2) }.unwrap();
-        assert!(ringal.alloc(CHUNKSIZE).is_none());
-        drop(buffer1);
-        assert!(ringal.alloc(CHUNKSIZE).is_some());
-    }
-
-    #[test]
-    fn test_continuous_realloc() {
-        let mut ringal = Ringal::new(BUFSIZE);
-        let iterations = BUFSIZE / (CHUNKSIZE + U32SIZE) * 10;
-        let mut buffers = VecDeque::with_capacity(2);
-        buffers.push_back(unsafe { ringal.fixed(MINALLOCBYTES) }.unwrap());
-        for i in MINALLOCBYTES..MINALLOCBYTES * 2 {
-            for _ in 0..iterations {
-                buffers.push_back(unsafe { ringal.fixed(i) }.unwrap());
-                buffers.pop_front();
-            }
-        }
-    }
-}
+mod tests;
