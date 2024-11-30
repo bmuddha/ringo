@@ -68,7 +68,7 @@ impl Ringal {
             inner,
             initialized: 0,
             capacity,
-            ringo: self,
+            ringal: self,
         })
     }
 

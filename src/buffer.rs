@@ -14,7 +14,7 @@ pub struct BufferWriter<'a> {
     pub(crate) header: HeaderMut,
     pub(crate) initialized: usize,
     pub(crate) capacity: usize,
-    pub(crate) ringo: &'a mut Ringal,
+    pub(crate) ringal: &'a mut Ringal,
 }
 
 impl<'a> BufferWriter<'a> {
@@ -38,7 +38,7 @@ impl<'a> Write for BufferWriter<'a> {
         let required = self.initialized + len;
         if required > self.capacity {
             let extra = (required - self.capacity).max(MINALLOCBYTES);
-            self.ringo.extend(&self.header, extra)?;
+            self.ringal.extend(&self.header, extra)?;
             self.capacity = self.header.capacity() as usize * U32SIZE;
         }
         unsafe {
